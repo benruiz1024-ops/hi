@@ -1,12 +1,15 @@
 from pathlib import Path
-import os, time
+import os
+import time
 import gradio as gr
 from PIL import Image
 
 ROOT = Path('/kaggle/working/Wan2GP')
 OUTPUTS = Path('/kaggle/working/Wan2GP-outputs')
 OUTPUTS.mkdir(parents=True, exist_ok=True)
+
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+os.environ.setdefault('WAN_CACHE_DIR', '/kaggle/temp/Wan2GP-data/cache')
 
 from shared.api import init
 
@@ -17,36 +20,34 @@ session = init(
     console_output=True,
 )
 
-# Exactly three friendly image-to-video choices.
 WANTED = [
     ('✨ LTX-2.3 Distilled 1.1', 'ltx2_22B_distilled_1_1'),
     ('🌊 Wan 2.2 I2V', 'i2v_2_2'),
-    ('🎬 HunyuanVideo 1.5', 'hunyuan_1_5_t2v'),
+    ('🎬 HunyuanVideo 1.5 I2V', 'hunyuan_1_5_i2v'),
 ]
 
-# Only expose choices that the current WanGP build says can accept images.
-i2v_defs = session.list_model_defs(main_output='video', inputs='image')
-i2v_ids = {m['model_type'] for m in i2v_defs}
-MODEL_CHOICES = [(label, mid) for label, mid in WANTED if mid in i2v_ids]
-
-# Some builds do not tag dual-mode Hunyuan with inputs='image'; allow it if present at all.
-all_video_ids = {m['model_type'] for m in session.list_model_defs(main_output='video')}
-for label, mid in WANTED:
-    if mid in all_video_ids and mid not in {x[1] for x in MODEL_CHOICES}:
-        MODEL_CHOICES.append((label, mid))
-
+available_ids = {m['model_type'] for m in session.list_model_defs(main_output='video')}
+MODEL_CHOICES = [(label, mid) for label, mid in WANTED if mid in available_ids]
+missing = [(label, mid) for label, mid in WANTED if mid not in available_ids]
+if missing:
+    print('Warning: unavailable model IDs:', missing)
 if not MODEL_CHOICES:
     raise RuntimeError('None of the Lily Video Studio models were found in this WanGP build.')
-
 DEFAULT_MODEL = MODEL_CHOICES[0][1]
 
 
-def _auto_resolution(image_path, quality):
+def _auto_resolution(image_path, quality, model_type, defaults):
+    # Hunyuan 1.5 I2V ships as a 720p model; preserve its native default.
+    if model_type == 'hunyuan_1_5_i2v':
+        return defaults.get('resolution', '1280x720')
+
     if not image_path:
-        return '832x480'
+        return defaults.get('resolution', '832x480')
+
     with Image.open(image_path) as im:
         w, h = im.size
     portrait = h > w
+
     if quality == 'Fast':
         return '480x832' if portrait else '832x480'
     return '720x1280' if portrait else '1280x720'
@@ -68,7 +69,7 @@ def _generate(image_path, prompt, model_type, seconds, quality, seed):
         return
 
     label = _model_label(model_type)
-    yield None, f'📦 / ✨ Preparing {label}… first use can include a giant download.'
+    yield None, f'✨ Preparing {label}…'
 
     try:
         settings = session.get_default_settings(model_type)
@@ -77,16 +78,17 @@ def _generate(image_path, prompt, model_type, seconds, quality, seed):
             'prompt': prompt.strip(),
             'image_start': image_path,
             'image_prompt_type': 'S',
+            # WanGP officially accepts seconds strings and snaps them to a valid frame count.
+            'video_length': f'{int(seconds)}s',
             'duration_seconds': int(seconds),
-            'resolution': _auto_resolution(image_path, quality),
+            'resolution': _auto_resolution(image_path, quality, model_type, settings),
             'batch_size': 1,
             'seed': int(seed),
         })
 
-        # Fast mode is deliberately conservative for Kaggle T4.
         if quality == 'Fast' and 'num_inference_steps' in settings:
             try:
-                settings['num_inference_steps'] = max(4, min(int(settings['num_inference_steps']), 8))
+                settings['num_inference_steps'] = min(int(settings['num_inference_steps']), 8)
             except Exception:
                 pass
 
@@ -142,7 +144,11 @@ footer { display:none !important; }
 with gr.Blocks(css=CSS, theme=gr.themes.Soft(), title='Lily Video Studio') as demo:
     gr.HTML("<div id='hero'><h1>🌷 Lily Video Studio</h1><p>drop a picture. tell it what happens. make a tiny movie.</p></div>")
     image = gr.Image(type='filepath', label='📸 Your picture', height=320)
-    prompt = gr.Textbox(label='✨ What should happen?', placeholder='she slowly turns toward the camera, natural movement, gentle wind in her hair…', lines=3)
+    prompt = gr.Textbox(
+        label='✨ What should happen?',
+        placeholder='she slowly turns toward the camera, natural movement, gentle wind in her hair…',
+        lines=3,
+    )
 
     with gr.Row():
         model = gr.Dropdown(choices=MODEL_CHOICES, value=DEFAULT_MODEL, label='🧠 Model')
@@ -160,7 +166,7 @@ with gr.Blocks(css=CSS, theme=gr.themes.Soft(), title='Lily Video Studio') as de
     make.click(fn=_generate, inputs=[image, prompt, model, seconds, quality, seed], outputs=[output, status])
     cancel.click(fn=_cancel, outputs=status, queue=False)
 
-    gr.Markdown('<small>Runs on your Kaggle GPU using WanGP + open video models. A model downloads automatically the first time you use it in a fresh Kaggle session.</small>')
+    gr.Markdown('<small>Runs on your Kaggle GPU using WanGP + open video models. The notebook prewarms the three model families before this UI opens.</small>')
 
 if __name__ == '__main__':
     demo.queue(default_concurrency_limit=1).launch(
