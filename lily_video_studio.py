@@ -18,34 +18,22 @@ session = init(
     console_output=True,
 )
 
-# Discover current image-to-video models dynamically so this survives WanGP updates.
-model_defs = session.list_model_defs(main_output='video', inputs='image')
-by_id = {m['model_type']: m for m in model_defs}
+# Three deliberately chosen image-to-video models.
+# WanGP downloads the checkpoint the first time that model is actually used.
+MODEL_CHOICES = [
+    ('✨ LTX-2.3 Distilled 1.1', 'ltx2_22B_distilled_1_1'),
+    ('🌊 Wan 2.2 I2V', 'i2v_2_2'),
+    ('🎬 HunyuanVideo 1.5', 'hunyuan_1_5_t2v'),
+]
 
+# Keep only models that this installed WanGP build actually exposes.
+available = {m['model_type'] for m in session.list_model_defs(main_output='video')}
+MODEL_CHOICES = [(label, mid) for label, mid in MODEL_CHOICES if mid in available]
 
-def _pick_friendly_models():
-    wanted = [
-        ('✨ LTX 2.3 Distilled', ['LTX-2 2.3 Distilled 1.1', 'LTX-2 2.3 Distilled']),
-        ('🌊 Wan 2.2 I2V', ['Wan 2.2 I2V']),
-        ('🎬 HunyuanVideo 1.5', ['HunyuanVideo 1.5']),
-    ]
-    out = []
-    used = set()
-    for friendly, needles in wanted:
-        for m in model_defs:
-            name = str(m.get('name', ''))
-            if any(n.lower() in name.lower() for n in needles):
-                if m['model_type'] not in used:
-                    out.append((friendly, m['model_type']))
-                    used.add(m['model_type'])
-                break
-    if not out:
-        for m in model_defs[:6]:
-            out.append((m.get('name', m['model_type']), m['model_type']))
-    return out
+if not MODEL_CHOICES:
+    raise RuntimeError('None of the three Lily Video Studio models were found in this WanGP build.')
 
-MODEL_CHOICES = _pick_friendly_models()
-DEFAULT_MODEL = MODEL_CHOICES[0][1] if MODEL_CHOICES else None
+DEFAULT_MODEL = MODEL_CHOICES[0][1]
 
 
 def _auto_resolution(image_path, quality):
@@ -67,10 +55,20 @@ def _generate(image_path, prompt, model_type, seconds, quality, seed):
         yield None, '✍️ Tell me what should happen.'
         return
     if not model_type:
-        yield None, '😵 No compatible image-to-video model was found.'
+        yield None, '😵 Pick a model.'
         return
 
-    yield None, '✨ Waking up the model… first run may download a BIG checkpoint.'
+    label = next((name for name, mid in MODEL_CHOICES if mid == model_type), model_type)
+    try:
+        availability = session.get_model_availability(model_type)
+        downloaded = bool(availability.get('available') or availability.get('is_available') or availability.get('downloaded'))
+    except Exception:
+        downloaded = False
+
+    if downloaded:
+        yield None, f'✨ Waking up {label}…'
+    else:
+        yield None, f'📦 First use of {label}: downloading its checkpoint, then making your video…'
 
     try:
         settings = session.get_default_settings(model_type)
@@ -85,10 +83,10 @@ def _generate(image_path, prompt, model_type, seconds, quality, seed):
             'seed': int(seed),
         })
 
-        # Keep the UI simple while respecting model-native defaults.
+        # Fast is intentionally conservative for a free T4.
         if quality == 'Fast' and 'num_inference_steps' in settings:
             try:
-                settings['num_inference_steps'] = max(6, min(int(settings['num_inference_steps']), 12))
+                settings['num_inference_steps'] = max(4, min(int(settings['num_inference_steps']), 8))
             except Exception:
                 pass
 
@@ -156,7 +154,7 @@ with gr.Blocks(css=CSS, theme=gr.themes.Soft(), title='Lily Video Studio') as de
         outputs=[output, status],
     )
 
-    gr.Markdown("<small>Runs on your Kaggle GPU using WanGP + open video models.</small>")
+    gr.Markdown('<small>Runs on your Kaggle GPU using WanGP + open video models. Each model downloads automatically on first use.</small>')
 
 if __name__ == '__main__':
     demo.queue(default_concurrency_limit=1).launch(
